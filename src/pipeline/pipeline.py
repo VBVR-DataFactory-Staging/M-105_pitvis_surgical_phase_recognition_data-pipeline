@@ -1,41 +1,56 @@
-"""Pipeline for M-105 — MedVQA-2019 ImageCLEF clinical visual QA.
+"""Pipeline for M-105 — surgical-phase-recognition (laparoscopic cholecystectomy).
 
-Repurposed from the original PitVis scaffold (Figshare blocked AWS IPs and
-HF git-LFS kept failing). MedVQA-2019 has a permissive Zenodo direct
-download already mirrored to s3://med-vr-datasets/M-105/medvqa2019/.
+Each raw segment (~80 consecutive endoscopic frames) becomes one VBVR sample.
+The first / last / ground-truth videos are constructed as follows:
 
-Each sample = one medical image + 4 QA pairs (Modality / Plane / Organ
-System / Abnormality). The ground-truth video sequentially reveals each
-question and its answer overlaid next to the image.
+  first_video.mp4    : segment frames + question banner ("Phase: ?")
+  ground_truth.mp4   : segment frames + colour-coded banner with the
+                       Cholec80 phase name revealed
+  last_video.mp4     : tail of the segment with the answer banner shown
+
+Augmentation (modest) is OPTIONAL via num_samples > unique-segments. We do not
+horizontal-flip — surgical anatomy is asymmetric (gallbladder is right-of-
+midline, cystic duct/artery are right-anterior).
 """
 from __future__ import annotations
+import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Iterator, List, Optional
 
 import cv2
+import numpy as np
 
 from core.pipeline import BasePipeline, OutputWriter, SampleProcessor, TaskSample
 from src.download.downloader import create_downloader
 from src.pipeline.config import TaskConfig
 from src.pipeline.transforms import (
-    build_frames,
-    load_and_resize,
+    PHASES,
+    load_frame,
     make_video,
-    render_panel,
-    select_qa_pairs,
+    phase_for_segment,
+    render_with_banner,
 )
 
 
+# Live-stream stdout so EC2 log tail sees progress without buffering.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+
 PROMPT = (
-    "This video shows a clinical medical image (MedVQA-2019 ImageCLEF) "
-    "annotated with a sequence of question/answer panels covering four "
-    "diagnostic categories: Modality, Imaging Plane, Organ System, and "
-    "Abnormality. Each panel reveals one question (yellow) followed by its "
-    "ground-truth answer (green). For each question shown in the video, "
-    "report the answer exactly as displayed."
+    "This video shows a continuous segment of a laparoscopic cholecystectomy "
+    "(gallbladder removal). Identify which of the seven canonical Cholec80 "
+    "surgical phases is being performed: Preparation, "
+    "CalotTriangleDissection, ClippingCutting, GallbladderDissection, "
+    "GallbladderPackaging, CleaningCoagulation, or GallbladderRetraction. "
+    "Reveal the phase name in the coloured banner beneath the surgical view, "
+    "matching the colour and label shown in the ground-truth video."
 )
 
 
@@ -51,37 +66,44 @@ class TaskPipeline(BasePipeline):
     def download(self) -> Iterator[dict]:
         yield from self.downloader.iter_samples()
 
-    def process_sample(self, raw_sample: dict, idx: int) -> Optional[TaskSample]:
-        image_id = raw_sample["image_id"]
-        image_path = raw_sample["image_path"]
-        qa = raw_sample["qa"]
+    def _load_segment_frames(self, raw_sample: dict) -> List[np.ndarray]:
         cfg = self.task_config
+        size = tuple(cfg.target_size)
+        stride = max(1, int(cfg.frame_stride))
+        out: List[np.ndarray] = []
+        for fp in raw_sample["frames"][::stride]:
+            img = load_frame(fp, size)
+            if img is not None:
+                out.append(img)
+        return out
 
-        base = load_and_resize(image_path, tuple(cfg.target_size))
-        if base is None:
+    def process_sample(self, raw_sample: dict, idx: int) -> Optional[TaskSample]:
+        cfg = self.task_config
+        seg_id = raw_sample["segment_id"]
+        video_id = raw_sample["video_id"]
+        rel_pos = raw_sample["rel_pos"]
+        phase_idx = phase_for_segment(rel_pos)
+        phase_name, phase_color = PHASES[phase_idx]
+
+        frames = self._load_segment_frames(raw_sample)
+        if not frames:
+            print(f"  [skip] {seg_id}: no readable frames", flush=True)
             return None
 
-        chosen = select_qa_pairs(qa, cfg.max_qa_pairs)
-        if not chosen:
-            return None
+        # Build the three video tracks.
+        gt_frames = [
+            render_with_banner(f, phase_idx, len(PHASES), True, cfg.banner_height)
+            for f in frames
+        ]
+        first_frames = [
+            render_with_banner(f, phase_idx, len(PHASES), False, cfg.banner_height)
+            for f in frames
+        ]
+        # Last clip = back half of the segment with answer revealed.
+        half = max(1, len(gt_frames) // 2)
+        last_frames = gt_frames[half:] or gt_frames[-1:]
 
-        frames, first_rgb, last_rgb, last_segment = build_frames(
-            base_img=base,
-            qa_pairs=chosen,
-            frames_per_panel=cfg.frames_per_panel,
-        )
-
-        # First-segment clip: image-only intro + first Q/A reveal.
-        intro_panel = render_panel(base, None, "Reviewing medical image...", None, 0, len(chosen))
-        first_q = render_panel(base, chosen[0].get("category"), chosen[0]["question"], None, 0, len(chosen))
-        first_a = render_panel(base, chosen[0].get("category"), chosen[0]["question"], chosen[0]["answer"], 0, len(chosen))
-        first_segment = (
-            [intro_panel] * cfg.frames_per_panel
-            + [first_q] * cfg.frames_per_panel
-            + [first_a] * cfg.frames_per_panel
-        )
-
-        task_id = f"medvqa2019_{image_id}_{idx:05d}"
+        task_id = f"{cfg.domain}_{video_id}_{raw_sample['start_frame']:05d}_{idx:05d}"
         TMP_DIR.mkdir(parents=True, exist_ok=True)
         tmp = TMP_DIR / task_id
         tmp.mkdir(parents=True, exist_ok=True)
@@ -90,33 +112,33 @@ class TaskPipeline(BasePipeline):
         first_path = tmp / "first_video.mp4"
         last_path = tmp / "last_video.mp4"
 
-        make_video(frames, gt_path, cfg.fps)
-        make_video(first_segment, first_path, cfg.fps)
-        make_video(last_segment, last_path, cfg.fps)
+        make_video(gt_frames, gt_path, cfg.fps)
+        make_video(first_frames, first_path, cfg.fps)
+        make_video(last_frames, last_path, cfg.fps)
+
+        first_rgb = cv2.cvtColor(first_frames[0], cv2.COLOR_BGR2RGB)
+        final_rgb = cv2.cvtColor(gt_frames[-1], cv2.COLOR_BGR2RGB)
 
         metadata = {
             "task_id": task_id,
-            "source_dataset": "MedVQA-2019 ImageCLEF (Zenodo)",
-            "image_id": image_id,
-            "split": raw_sample.get("split"),
-            "num_qa_pairs": len(chosen),
-            "qa_pairs": [
-                {
-                    "category": q.get("category"),
-                    "question": q["question"],
-                    "answer": q["answer"],
-                }
-                for q in chosen
-            ],
+            "source_dataset": "CholecSeg8k (Cholec80 mirror)",
+            "video_id": video_id,
+            "segment_id": seg_id,
+            "start_frame": raw_sample["start_frame"],
+            "num_frames": len(frames),
             "fps": cfg.fps,
+            "phase_idx": phase_idx,
+            "phase_name": phase_name,
+            "phase_color_bgr": list(phase_color),
+            "rel_pos_in_video": round(rel_pos, 4),
         }
 
         return SampleProcessor.build_sample(
             task_id=task_id,
             domain=cfg.domain,
-            first_image=cv2.cvtColor(base, cv2.COLOR_BGR2RGB),
+            first_image=first_rgb,
             prompt=PROMPT,
-            final_image=last_rgb,
+            final_image=final_rgb,
             first_video=str(first_path),
             last_video=str(last_path),
             ground_truth_video=str(gt_path),
@@ -129,17 +151,17 @@ class TaskPipeline(BasePipeline):
         s3_prefix = os.environ.get("INCREMENTAL_S3_PREFIX", "")
         writer = OutputWriter(self.config.output_dir)
         samples: List[TaskSample] = []
-        cap = self.task_config.num_samples or 300
+        cap = self.task_config.num_samples or 800
         processed = 0
         try:
             for idx, raw in enumerate(self.download()):
                 if processed >= cap:
-                    print(f"  Hit num_samples cap={cap}, stopping")
+                    print(f"  Hit num_samples cap={cap}, stopping", flush=True)
                     break
                 try:
                     sample = self.process_sample(raw, idx)
                 except Exception as e:
-                    print(f"  [warn] sample {idx} failed: {e}")
+                    print(f"  [warn] sample {idx} failed: {e}", flush=True)
                     sample = None
                 if sample is None:
                     continue
@@ -155,8 +177,8 @@ class TaskPipeline(BasePipeline):
                         check=False,
                     )
                 if processed % 10 == 0:
-                    print(f"  Processed {processed}/{cap} samples")
-            print(f"Done! Processed {processed} samples (cap={cap})")
+                    print(f"  Processed {processed}/{cap} samples", flush=True)
+            print(f"Done! Processed {processed} samples (cap={cap})", flush=True)
         finally:
             if TMP_DIR.exists():
                 shutil.rmtree(TMP_DIR, ignore_errors=True)
