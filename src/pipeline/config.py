@@ -1,38 +1,25 @@
-"""Pipeline configuration for M-041 (surgical_phase_recognition)."""
+"""Pipeline configuration for M-105 MedVQA-2019 (ImageCLEF clinical visual QA)."""
 from pathlib import Path
 from pydantic import Field
 from core.pipeline import PipelineConfig
 
 
 class TaskConfig(PipelineConfig):
-    """Configuration for M-041 pipeline.
+    """MedVQA-2019 (ImageCLEF) clinical visual QA task config."""
 
-    Inherited from PipelineConfig:
-        num_samples: Optional[int]  # Max samples (None = all)
-        domain: str
-        output_dir: Path
-        split: str
-    """
+    domain: str = Field(default="medvqa2019_clinical_qa")
 
-    domain: str = Field(default="pitvis_surgical_phase_recognition")
-
-    s3_bucket: str = Field(
-        default="med-vr-datasets",
-        description="S3 bucket containing the raw M-041 data",
-    )
-    s3_prefix: str = Field(
-        default="M-105_PitVis/raw/",
-        description="S3 key prefix for the dataset raw data",
-    )
-    fps: int = Field(
-        default=3,
-        description="Frames per second for the generated videos",
-    )
-    raw_dir: Path = Field(
-        default=Path("raw"),
-        description="Local directory for downloaded raw data",
-    )
-    task_prompt: str = Field(
-        default="This endoscopic pituitary surgery frame (PitVis). Predict the current surgical phase from the workflow taxonomy.",
-        description="The task instruction shown to the reasoning model.",
-    )
+    s3_bucket: str = Field(default="med-vr-datasets")
+    # raw extracted on S3:
+    #   medvqa2019/ImageClef-2019-VQA-Med-Training/Train_images/synpic*.jpg
+    #   medvqa2019/ImageClef-2019-VQA-Med-Training/QAPairsByCategory/C{1..4}_*_train.txt
+    #   medvqa2019/ImageClef-2019-VQA-Med-Validation/Val_images/synpic*.jpg
+    #   medvqa2019/ImageClef-2019-VQA-Med-Validation/QAPairsByCategory/C{1..4}_*_val.txt
+    s3_prefix: str = Field(default="M-105/medvqa2019/")
+    fps: int = Field(default=4)
+    raw_dir: Path = Field(default=Path("raw"))
+    target_size: tuple = Field(default=(640, 640))
+    # Each sample has up to 4 QA pairs (one per category).
+    max_qa_pairs: int = Field(default=4)
+    # Frames each (question_only) and (question+answer) panel is held.
+    frames_per_panel: int = Field(default=5)
